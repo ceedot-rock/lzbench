@@ -84,7 +84,16 @@ pub extern "C" fn pulsar_decode_c(input_ptr: *const c_uchar, input_len: usize, o
 #[no_mangle]
 pub extern "C" fn pulsar_free(ptr: *mut c_uchar, len: usize) { if ptr.is_null() { return; } unsafe { let _ = Box::from_raw(std::slice::from_raw_parts_mut(ptr, len)); } }
 
-/// Compress into caller buffer. Returns encoded length, 0 if incompressible, -1 on error.
+/// Frame flags for the lzbench FFI path: a 1-byte flag followed by the payload.
+/// 0x01 = pulsar-coded, 0x00 = stored (raw copy, used when the input doesn't
+/// compress). The stored fallback guarantees the compressor never returns 0
+/// on success (lzbench treats any return <= 0 as a compression error).
+const PULSAR_FRAME_STORED: u8 = 0x00;
+const PULSAR_FRAME_CODED: u8 = 0x01;
+
+/// Compress into caller buffer. Returns total bytes written (flag + payload),
+/// -1 on error. Any Rust panic is caught and reported as -1: a panic must
+/// never cross the FFI boundary and abort the host process.
 #[no_mangle]
 pub unsafe extern "C" fn pulsar_compress(
     in_ptr: *const c_uchar,
@@ -92,23 +101,38 @@ pub unsafe extern "C" fn pulsar_compress(
     out_ptr: *mut c_uchar,
     out_len: usize,
 ) -> isize {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return -1;
-    }
-    let input = std::slice::from_raw_parts(in_ptr, in_len);
-    match pulsar_encode(input) {
-        Some(enc) => {
-            if enc.len() > out_len {
-                return -1;
-            }
-            std::ptr::copy_nonoverlapping(enc.as_ptr(), out_ptr, enc.len());
-            enc.len() as isize
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if in_ptr.is_null() || out_ptr.is_null() || out_len < 1 {
+            return -1isize;
         }
-        None => 0,
-    }
+        let input = std::slice::from_raw_parts(in_ptr, in_len);
+        match pulsar_encode(input) {
+            Some(enc) if enc.len() + 1 <= out_len => {
+                *out_ptr = PULSAR_FRAME_CODED;
+                std::ptr::copy_nonoverlapping(enc.as_ptr(), out_ptr.add(1), enc.len());
+                (enc.len() + 1) as isize
+            }
+            _ => {
+                // Stored fallback: nothing compressed smaller (or the coded
+                // frame wouldn't fit); store the raw input instead of
+                // returning 0, which lzbench reports as a compression error.
+                if input.len() + 1 > out_len {
+                    return -1;
+                }
+                *out_ptr = PULSAR_FRAME_STORED;
+                if !input.is_empty() {
+                    std::ptr::copy_nonoverlapping(in_ptr, out_ptr.add(1), input.len());
+                }
+                (input.len() + 1) as isize
+            }
+        }
+    }));
+    r.unwrap_or(-1)
 }
 
-/// Decompress into caller buffer. Returns decoded length, -1 on error.
+/// Decompress into caller buffer. Expects the 1-byte frame flag written by
+/// pulsar_compress. Returns decoded length, -1 on error. Panics are caught
+/// and reported as -1 (never cross the FFI boundary).
 #[no_mangle]
 pub unsafe extern "C" fn pulsar_decompress(
     in_ptr: *const c_uchar,
@@ -116,20 +140,38 @@ pub unsafe extern "C" fn pulsar_decompress(
     out_ptr: *mut c_uchar,
     out_len: usize,
 ) -> isize {
-    if in_ptr.is_null() || out_ptr.is_null() {
-        return -1;
-    }
-    let input = std::slice::from_raw_parts(in_ptr, in_len);
-    match pulsar_decode(input) {
-        Ok(dec) => {
-            if dec.len() > out_len {
-                return -1;
-            }
-            std::ptr::copy_nonoverlapping(dec.as_ptr(), out_ptr, dec.len());
-            dec.len() as isize
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if in_ptr.is_null() || out_ptr.is_null() || in_len < 1 {
+            return -1isize;
         }
-        Err(_) => -1,
-    }
+        let flag = *in_ptr;
+        let payload = std::slice::from_raw_parts(in_ptr.add(1), in_len - 1);
+        match flag {
+            PULSAR_FRAME_STORED => {
+                if payload.len() > out_len {
+                    return -1;
+                }
+                if !payload.is_empty() {
+                    std::ptr::copy_nonoverlapping(payload.as_ptr(), out_ptr, payload.len());
+                }
+                payload.len() as isize
+            }
+            PULSAR_FRAME_CODED => match pulsar_decode(payload) {
+                Ok(dec) => {
+                    if dec.len() > out_len {
+                        return -1;
+                    }
+                    if !dec.is_empty() {
+                        std::ptr::copy_nonoverlapping(dec.as_ptr(), out_ptr, dec.len());
+                    }
+                    dec.len() as isize
+                }
+                Err(_) => -1,
+            },
+            _ => -1,
+        }
+    }));
+    r.unwrap_or(-1)
 }
 #[no_mangle]
 pub extern "C" fn pulsar_version() -> *const c_uchar { VERSION.as_ptr() }
@@ -170,4 +212,52 @@ mod tests {
 
     #[test]
     fn text_phrase() { rt(&b"the quick brown fox jumps over the lazy dog. ".repeat(80)); }
+
+    /// FFI round-trip through pulsar_compress/pulsar_decompress, covering the
+    /// stored fallback (incompressible input must not return 0).
+    fn ffi_rt(src: &[u8]) {
+        let mut comp = vec![0u8; src.len() + 16];
+        let mut decomp = vec![0u8; src.len() + 16];
+        let cn = unsafe {
+            pulsar_compress(src.as_ptr(), src.len(), comp.as_mut_ptr(), comp.len())
+        };
+        assert!(cn > 0, "compress must return > 0, got {}", cn);
+        // Incompressible input takes the stored path: 1 flag byte + raw copy.
+        if crate::pulsar_encode(src).is_none() {
+            assert_eq!(comp[0], PULSAR_FRAME_STORED);
+            assert_eq!(cn as usize, src.len() + 1);
+        }
+        let dn = unsafe {
+            pulsar_decompress(comp.as_ptr(), cn as usize, decomp.as_mut_ptr(), decomp.len())
+        };
+        assert_eq!(dn as usize, src.len(), "decompress length mismatch");
+        assert_eq!(&decomp[..src.len()], src, "round-trip mismatch");
+    }
+
+    #[test]
+    fn ffi_roundtrip_compressible() {
+        ffi_rt(&b"the quick brown fox jumps over the lazy dog. ".repeat(200));
+    }
+
+    #[test]
+    fn ffi_roundtrip_incompressible() {
+        // Deterministic incompressible input (xorshift64*).
+        let mut x: u64 = 0x243F6A8885A308D3;
+        let src: Vec<u8> = (0..1000).map(|_| { x ^= x << 13; x ^= x >> 7; x ^= x << 17; (x >> 33) as u8 }).collect();
+        assert!(crate::pulsar_encode(&src).is_none(), "test input should be incompressible");
+        ffi_rt(&src);
+    }
+
+    #[test]
+    fn ffi_roundtrip_tiny() { ffi_rt(b"hello"); }
+
+    #[test]
+    fn ffi_bad_flag_rejected() {
+        let mut out = vec![0u8; 16];
+        let bad = [0x42u8, 1, 2, 3];
+        let n = unsafe { pulsar_decompress(bad.as_ptr(), bad.len(), out.as_mut_ptr(), out.len()) };
+        assert_eq!(n, -1);
+        let n = unsafe { pulsar_decompress(bad.as_ptr(), 0, out.as_mut_ptr(), out.len()) };
+        assert_eq!(n, -1);
+    }
 }

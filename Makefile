@@ -268,12 +268,21 @@ endif
 PULSAR_SRC_DIR=bwt/pulsar/
 ifneq ($(DONT_BUILD_PULSAR),1)
     DONT_BUILD_PULSAR := 1
+
+    # Only build Pulsar for native, non-32-bit, non-Windows builds (mirrors
+    # the Density block). Pulsar uses edition 2021, so unlike Density it
+    # needs no minimum-cargo-version check.
     ifneq ($(HAVE_CARGO),1)
         $(info Cargo not found – skipping Pulsar build)
-    else ifneq ($(HOST_ARCH),$(TARGET_ARCH))
-    else ifeq ($(BUILD_ARCH),32-bit)
+    else ifneq ($(HOST_ARCH),$(TARGET_ARCH)) # Skip cross-compilation
+    else ifeq ($(BUILD_ARCH),32-bit)         # Skip user requested 32-bit compilation
+    else ifneq (,$(filter Windows%,$(OS)))   # Skip Windows builds
+    else ifeq ($(BUILD_STATIC),1)            # Skip static builds: a Rust staticlib carries its own std, clashing with density's at link time
+        $(info Skipping Pulsar build for BUILD_STATIC=1)
     else
-        LDFLAGS += -L$(PULSAR_SRC_DIR)target/release -lpulsar -ldl -lpthread -lm
+        PULSAR_BUILD_TYPE=cdylib
+
+        LDFLAGS += -Wl,-rpath,$(PULSAR_SRC_DIR)target/release -L$(PULSAR_SRC_DIR)target/release -lpulsar
         DONT_BUILD_PULSAR := 0
     endif
 endif
@@ -1389,7 +1398,8 @@ PULSAR_LIB:
 ifneq ($(DONT_BUILD_PULSAR),1)
 	@echo "Building Pulsar..."
 	cd $(PULSAR_SRC_DIR) && \
-	cargo rustc --crate-type=staticlib --release -- --print=native-static-libs
+	RUSTFLAGS="-C target-cpu=native -C linker=$(lastword $(CXX))" \
+	cargo rustc --crate-type=$(PULSAR_BUILD_TYPE) --release -- --print=native-static-libs
 endif
 
 misc/skim/libskim.a: misc/skim/src/root.zig
